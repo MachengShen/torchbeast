@@ -1,0 +1,21 @@
+MuJoCo Pro Lab license activation key, number 6827, type 6.
+
+Issued to Prof. Jonathan How, MIT.
+
+Expires October 29, 2020.
+
+Do not share this file with anyone other than the users covered
+by your license agreement with Roboti LLC. This file activates
+MuJoCo Pro on any computer running any supported OS.
+
+Do not modify this file. Its entire content, including the
+plain text section, is used by the activation manager.
+
+7c23935dc36d7608e0c3cb0bd205bf2c8d7b2ecd29ce1060d11986df8a41ea0d
+58510198e05cc49023b92707aee342dd0cbe19a576ad44cd9e41d13f69523e3b
+8df8d19b4923c526715fbb76976df9cfc9154fc9181586a7dcac2a03b6537878
+a331c05d87e28665f853d10e3c9d5583a4d0cb2fc6aba23390f70b020e8ddae5
+33e82c24d6a04f47ac0c1b5b1d20aa5f4e4edba7e710ac1fc010f3e619c41c8e
+9e16205c93185b21682f43c6d03816290ef6b234b9bf974d02a1e76795816d87
+a1a61185f608d2a08d1d598efc31d24da0bc7fc5e25135b78439d0277e166009
+518f7d6501509731ccbdbcb963e89be05906a41094ee31788fcdf16553ecbd97
