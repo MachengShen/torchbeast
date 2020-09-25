@@ -24,6 +24,7 @@ import typing
 
 os.environ["OMP_NUM_THREADS"] = "1"  # Necessary for multithreading.
 
+import gym
 import torch
 from torch import multiprocessing as mp
 from torch import nn
@@ -39,6 +40,9 @@ from torchbeast.core import vtrace
 # yapf: disable
 parser = argparse.ArgumentParser(description="PyTorch Scalable Agent")
 
+parser.add_argument("--env_type", type=str, choices=['mujoco', 'atari'],
+                    default="atari",
+                    help="Gym environment type.")
 parser.add_argument("--env", type=str, default="PongNoFrameskip-v4",
                     help="Gym environment.")
 parser.add_argument("--mode", default="train",
@@ -52,11 +56,11 @@ parser.add_argument("--disable_checkpoint", action="store_true",
                     help="Disable saving checkpoint.")
 parser.add_argument("--savedir", default="~/logs/torchbeast",
                     help="Root dir where experiment data will be saved.")
-parser.add_argument("--num_actors", default=4, type=int, metavar="N",
+parser.add_argument("--num_actors", default=12, type=int, metavar="N",
                     help="Number of actors (default: 4).")
-parser.add_argument("--total_steps", default=100000, type=int, metavar="T",
+parser.add_argument("--total_steps", default=2000000, type=int, metavar="T",
                     help="Total environment steps to train for.")
-parser.add_argument("--batch_size", default=8, type=int, metavar="B",
+parser.add_argument("--batch_size", default=64, type=int, metavar="B",
                     help="Learner batch size.")
 parser.add_argument("--unroll_length", default=80, type=int, metavar="T",
                     help="The unroll length (time dimension).")
@@ -636,6 +640,10 @@ Net = AtariNet
 
 
 def create_env(flags):
+    if flags.env_type == 'mujoco':
+        return gym.make(flags.env)
+    else:
+        assert flags.env_type == 'atari'
     return atari_wrappers.wrap_pytorch(
         atari_wrappers.wrap_deepmind(
             atari_wrappers.make_atari(flags.env),
