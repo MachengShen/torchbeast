@@ -21,10 +21,13 @@ import time
 import timeit
 import traceback
 import typing
+from mujoco_Net import MujocoNet
+from multi2single_wrapper import Multi2SingleWrapper
 
 os.environ["OMP_NUM_THREADS"] = "1"  # Necessary for multithreading.
 
 import gym
+import gym_compete
 import torch
 from torch import multiprocessing as mp
 from torch import nn
@@ -40,10 +43,11 @@ from torchbeast.core import vtrace
 # yapf: disable
 parser = argparse.ArgumentParser(description="PyTorch Scalable Agent")
 
-parser.add_argument("--env_type", type=str, choices=['mujoco', 'atari'],
-                    default="atari",
+parser.add_argument("--env_type", type=str, default='mujoco',
+                    choices=['mujoco', 'atari'],
                     help="Gym environment type.")
-parser.add_argument("--env", type=str, default="PongNoFrameskip-v4",
+parser.add_argument("--env", type=str, default='run-to-goal-ants-v0',
+                    choices=['run-to-goal-ants-v0', "PongNoFrameskip-v4"],
                     help="Gym environment.")
 parser.add_argument("--mode", default="train",
                     choices=["train", "test", "test_render"],
@@ -56,7 +60,7 @@ parser.add_argument("--disable_checkpoint", action="store_true",
                     help="Disable saving checkpoint.")
 parser.add_argument("--savedir", default="~/logs/torchbeast",
                     help="Root dir where experiment data will be saved.")
-parser.add_argument("--num_actors", default=12, type=int, metavar="N",
+parser.add_argument("--num_actors", default=7, type=int, metavar="N",
                     help="Number of actors (default: 4).")
 parser.add_argument("--total_steps", default=2000000, type=int, metavar="T",
                     help="Total environment steps to train for.")
@@ -66,7 +70,7 @@ parser.add_argument("--unroll_length", default=80, type=int, metavar="T",
                     help="The unroll length (time dimension).")
 parser.add_argument("--num_buffers", default=None, type=int,
                     metavar="N", help="Number of shared-memory buffers.")
-parser.add_argument("--num_learner_threads", "--num_threads", default=2, type=int,
+parser.add_argument("--num_learner_threads", "--num_threads", default=3, type=int,
                     metavar="N", help="Number learner threads.")
 parser.add_argument("--disable_cuda", action="store_true",
                     help="Disable CUDA.")
@@ -80,7 +84,7 @@ parser.add_argument("--baseline_cost", default=0.5,
                     type=float, help="Baseline cost/multiplier.")
 parser.add_argument("--discounting", default=0.99,
                     type=float, help="Discounting factor.")
-parser.add_argument("--reward_clipping", default="abs_one",
+parser.add_argument("--reward_clipping", default="none",
                     choices=["abs_one", "none"],
                     help="Reward clipping.")
 
@@ -120,14 +124,15 @@ def compute_entropy_loss(logits):
 
 
 def compute_policy_gradient_loss(logits, actions, advantages):
-    cross_entropy = F.nll_loss(
-        F.log_softmax(torch.flatten(logits, 0, 1), dim=-1),
-        target=torch.flatten(actions, 0, 1),
+    number_agents = actions.shape[-1]
+    cross_entropy_per_agent = [F.nll_loss(
+        F.log_softmax(torch.flatten(logits, 0, 1), dim=-1)[:, i, :],
+        target=torch.flatten(actions, 0, 1)[:, i],
         reduction="none",
-    )
-    cross_entropy = cross_entropy.view_as(advantages)
-    return torch.sum(cross_entropy * advantages.detach())
-
+    ).view_as(advantages[:, :, i]) for i in range(number_agents)]
+    policy_losses = [torch.sum(cross_entropy_per_agent[i] * advantages.detach()[:, :, i])
+                      for i in range(number_agents)]
+    return sum(policy_losses)
 
 def act(
     flags,
@@ -145,7 +150,12 @@ def act(
         gym_env = create_env(flags)
         seed = actor_index ^ int.from_bytes(os.urandom(4), byteorder="little")
         gym_env.seed(seed)
-        env = environment.Environment(gym_env)
+        if flags.env_type == 'atari':
+            num_agents = 1
+        else:
+            assert flags.env_type == 'mujoco'
+            num_agents = 2
+        env = environment.Environment(gym_env, num_agents)
         env_output = env.initial()
         agent_state = model.initial_state(batch_size=1)
         agent_output, unused_state = model(env_output, agent_state)
@@ -194,6 +204,17 @@ def act(
         print()
         raise e
 
+def get_num_agents(flag) -> int:
+    """
+    Get the number of agents according to flag
+    :param flag:
+    :return:
+    """
+    if flag.env_type == 'mujoco':
+        return 2
+    if not flag.env_type == 'atari':
+        raise ValueError("unexpected env_type")
+    return 1
 
 def get_batch(
     flags,
@@ -245,6 +266,8 @@ def learn(
         bootstrap_value = learner_outputs["baseline"][-1]
 
         # Move from obs[t] -> action[t] to action[t] -> obs[t].
+        # '1:' skips the first time step
+        # ':-1' skips the last output, for temporal difference learning
         batch = {key: tensor[1:] for key, tensor in batch.items()}
         learner_outputs = {key: tensor[:-1] for key, tensor in learner_outputs.items()}
 
@@ -260,10 +283,10 @@ def learn(
             behavior_policy_logits=batch["policy_logits"],
             target_policy_logits=learner_outputs["policy_logits"],
             actions=batch["action"],
-            discounts=discounts,
+            discounts=discounts, # missing last dim 1
             rewards=clipped_rewards,
-            values=learner_outputs["baseline"],
-            bootstrap_value=bootstrap_value,
+            values=learner_outputs["baseline"], # missing last dim 1
+            bootstrap_value=bootstrap_value, # missing first dim 80 and last dim 1
         )
 
         pg_loss = compute_policy_gradient_loss(
@@ -280,7 +303,7 @@ def learn(
 
         total_loss = pg_loss + baseline_loss + entropy_loss
 
-        episode_returns = batch["episode_return"][batch["done"]]
+        episode_returns = batch["episode_return"][batch["done"].expand_as(batch["episode_return"])]
         stats = {
             "episode_returns": tuple(episode_returns.cpu().numpy()),
             "mean_episode_return": torch.mean(episode_returns).item(),
@@ -300,18 +323,23 @@ def learn(
         return stats
 
 
-def create_buffers(flags, obs_shape, num_actions) -> Buffers:
+def create_buffers(flags, obs_shape:gym.spaces, action_shape: gym.spaces,
+                   num_agents: int) -> Buffers:
+    # here we assume homogenous agents for multi-agent case:
+    # same dimension for obs / action space,
+    # also assumes discrete action
     T = flags.unroll_length
+    frame_dtype = torch.uint8 if flags.env_type == 'atari' else torch.float32
     specs = dict(
-        frame=dict(size=(T + 1, *obs_shape), dtype=torch.uint8),
-        reward=dict(size=(T + 1,), dtype=torch.float32),
-        done=dict(size=(T + 1,), dtype=torch.bool),
-        episode_return=dict(size=(T + 1,), dtype=torch.float32),
+        frame=dict(size=(T + 1, *obs_shape), dtype=frame_dtype),
+        reward=dict(size=(T + 1, num_agents), dtype=torch.float32),
+        done=dict(size=(T + 1, 1), dtype=torch.bool),
+        episode_return=dict(size=(T + 1, num_agents), dtype=torch.float32),
         episode_step=dict(size=(T + 1,), dtype=torch.int32),
-        policy_logits=dict(size=(T + 1, num_actions), dtype=torch.float32),
-        baseline=dict(size=(T + 1,), dtype=torch.float32),
-        last_action=dict(size=(T + 1,), dtype=torch.int64),
-        action=dict(size=(T + 1,), dtype=torch.int64),
+        policy_logits=dict(size=(T + 1, *action_shape), dtype=torch.float32),
+        baseline=dict(size=(T + 1, num_agents), dtype=torch.float32),
+        last_action=dict(size=(T + 1, num_agents), dtype=torch.int64),
+        action=dict(size=(T + 1, num_agents), dtype=torch.int64),
     )
     buffers: Buffers = {key: [] for key in specs}
     for _ in range(flags.num_buffers):
@@ -319,6 +347,13 @@ def create_buffers(flags, obs_shape, num_actions) -> Buffers:
             buffers[key].append(torch.empty(**specs[key]).share_memory_())
     return buffers
 
+def get_model(flags) -> type:
+    # return a model class for initiating a model object
+    if flags.env_type == 'mujoco':
+        return MujocoNet
+    if not flags.env_type == 'atari':
+        raise ValueError("Unsupported env_type")
+    return AtariNet
 
 def train(flags):  # pylint: disable=too-many-branches, too-many-statements
     if flags.xpid is None:
@@ -349,9 +384,23 @@ def train(flags):  # pylint: disable=too-many-branches, too-many-statements
         flags.device = torch.device("cpu")
 
     env = create_env(flags)
+    Net = get_model(flags)
 
-    model = Net(env.observation_space.shape, env.action_space.n, flags.use_lstm)
-    buffers = create_buffers(flags, env.observation_space.shape, model.num_actions)
+    model = Net(env.observation_space.shape, env.action_space, flags.use_lstm)
+
+    def get_action_shape(flags, env: gym.envs) -> typing.Tuple[int]:
+        # return the action shape as a tuple
+        if flags.env_type == 'mujoco':
+            return env.action_space.shape
+        if not flags.env_type == 'atari':
+            raise ValueError("Unknown env_type")
+        return (env.action_space.n, )
+
+    action_shape = get_action_shape(flags, env)
+    buffers = create_buffers(flags,
+                             env.observation_space.shape,
+                             action_shape,
+                             get_num_agents(flags))
 
     model.share_memory()
 
@@ -383,9 +432,9 @@ def train(flags):  # pylint: disable=too-many-branches, too-many-statements
         )
         actor.start()
         actor_processes.append(actor)
-
+    Net = get_model(flags)
     learner_model = Net(
-        env.observation_space.shape, env.action_space.n, flags.use_lstm
+        env.observation_space.shape, env.action_space, flags.use_lstm
     ).to(device=flags.device)
 
     optimizer = torch.optim.RMSprop(
@@ -493,6 +542,9 @@ def train(flags):  # pylint: disable=too-many-branches, too-many-statements
                 mean_return,
                 pprint.pformat(stats),
             )
+            # for mujoco, need to manually print...
+            print(f"sps is: {sps}")
+            print(pprint.pformat(stats))
     except KeyboardInterrupt:
         return  # Try joining actors then quit.
     else:
@@ -519,7 +571,8 @@ def test(flags, num_episodes: int = 10):
 
     gym_env = create_env(flags)
     env = environment.Environment(gym_env)
-    model = Net(gym_env.observation_space.shape, gym_env.action_space.n, flags.use_lstm)
+    Net = get_model(flags)
+    model = Net(gym_env.observation_space.shape, gym_env.action_space, flags.use_lstm)
     model.eval()
     checkpoint = torch.load(checkpointpath, map_location="cpu")
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -547,10 +600,10 @@ def test(flags, num_episodes: int = 10):
 
 
 class AtariNet(nn.Module):
-    def __init__(self, observation_shape, num_actions, use_lstm=False):
+    def __init__(self, observation_shape, action_space, use_lstm=False):
         super(AtariNet, self).__init__()
         self.observation_shape = observation_shape
-        self.num_actions = num_actions
+        self.num_actions = action_space.n
 
         # Feature extraction.
         self.conv1 = nn.Conv2d(
@@ -566,7 +619,7 @@ class AtariNet(nn.Module):
         self.fc = nn.Linear(3136, 512)
 
         # FC output size + one-hot of last action + last reward.
-        core_output_size = self.fc.out_features + num_actions + 1
+        core_output_size = self.fc.out_features + self.num_actions + 1
 
         self.use_lstm = use_lstm
         if use_lstm:
@@ -626,22 +679,18 @@ class AtariNet(nn.Module):
             # Don't sample when testing.
             action = torch.argmax(policy_logits, dim=1)
 
-        policy_logits = policy_logits.view(T, B, self.num_actions)
-        baseline = baseline.view(T, B)
-        action = action.view(T, B)
+        policy_logits = policy_logits.view(T, B, 1, self.num_actions)
+        baseline = baseline.view(T, B, 1)
+        action = action.view(T, B, 1)
 
         return (
             dict(policy_logits=policy_logits, baseline=baseline, action=action),
             core_state,
         )
 
-
-Net = AtariNet
-
-
 def create_env(flags):
     if flags.env_type == 'mujoco':
-        return gym.make(flags.env)
+        return Multi2SingleWrapper(gym.make(flags.env))
     else:
         assert flags.env_type == 'atari'
     return atari_wrappers.wrap_pytorch(

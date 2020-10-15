@@ -8,3 +8,6 @@ cd multiagent-competition
 source env_setup.sh
 python3.6 -m pip uninstall numpy
 python3.6 -m pip install numpy
+
+# for polybeast, last step
+python setup.py build develop
